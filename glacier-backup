@@ -1,0 +1,228 @@
+#! /usr/bin/env python
+
+"""
+Backup photos in directories to glacier.
+This assumes that the photos are organised with one folder per event.
+The backup state is stored in a file in the directory called .backupstatus
+
+This file either contains the string "ignore", which instructs glacier backup
+to not backup the file, or a list of lines of the form
+md5sum size relative/to/filename\n
+
+We don't support new lines in the filenames.
+
+Backups continue like this:
+Find a directory which is not fully backed up.
+Recursively find all the files under the folder to be backed up
+tar, bz2 and gpg the contents into a temporary file
+Upload this to glacier with boto.
+Write the .backupstatus file
+
+As an optimisation, we backup directories that definately need doing
+(there is no .backupstatus file) first, and then 
+"""
+
+import unittest
+import sys
+import re
+import hashlib
+import argparse
+from os.path import join
+import os
+import datetime
+import subprocess
+import tarfile
+from operator import attrgetter
+
+
+
+def unjoin(abspath, root):
+	if not abspath.startswith(root):
+		raise Exception('unjoin: %s doesnt start with %s' % (abspath, root))
+	p = abspath[len(root):]
+	if p.startswith('/'):
+		return p[1:]
+	else:
+		return p
+	
+
+class Backup(object):
+	"""Represents a set of files that can or have been backed up"""
+	def __init__(self, abspath=None):
+		self.files = {} # a map from path to metadata
+		self.abspath = abspath
+	def addmetadata(self, filemetadata):
+		self.files[filemetadata.relpath] = filemetadata
+	def backupstatus(self):
+		files = self.files.values()
+		files.sort(key=attrgetter('relpath'))
+		return "".join([f.save() + '\n' for f in files])
+	def writebackupstatus(self):
+		"""Write the .backupstatus file to the abspath/.backupstatus.
+		Call this after uploading the backup to glacier"""
+		with open(join(self.abspath,'.backupstatus'), 'w') as f:
+			f.write(self.backupstatus())
+	def writebackup(self, backupfilename, gpgkeys=None):
+		"""Backup the files from disk to a gpg'd tar.bz2""" 
+		with open(backupfilename, 'wb') as outfile:
+			cmdline = ['gpg', '-e', '--batch']
+			for k in gpgkeys:
+				cmdline.append('-r')
+				cmdline.append(k)
+			cmdline.append('-')
+			gpgproc = subprocess.Popen(cmdline, stdin=subprocess.PIPE, stdout=outfile)
+			tarball = tarfile.open(mode='w|bz2', fileobj=gpgproc.stdin)
+			for file in self.files.values():
+				if os.stat(join(self.abspath, file.relpath)).st_size != file.size:
+					raise Exception("Length of file %s has changed. Aborting" % file.relpath)
+				tarball.add(join(self.abspath, file.relpath), arcname=file.relpath, recursive=False)
+			tarball.close()
+			gpgproc.stdin.close()
+			gpgproc.wait()	
+	def __str__(self):
+		return "Backup(%d files in %s)" % (len(self.files), self.abspath)
+	def __repr__(self):
+		return str(self)
+	def __eq__(self, other):
+		return isinstance(other,Backup) and (other.backupstatus() == self.backupstatus())
+NoBackup = object()
+BackupUnnecessary = object()
+
+
+class FileMetadata(object):
+	def __init__(self, relpath, md5sum, size):
+		if '\n' in relpath:
+			raise Exception("paths containing \\n are unsupported");
+		self.relpath = relpath
+		self.md5sum = md5sum
+		self.size = size
+	def save(self):
+		return "%s %d %s" % (self.md5sum, self.size, self.relpath)
+	def __eq__(self, other):
+		return (isinstance(other, FileMetadata) 
+			and self.relpath == other.relpath 
+			and self.md5sum == other.md5sum
+			and self.size == other.size )
+	def __str__(self):
+		return self.save()
+def filemetadataforpath(root, relpath):
+	abspath = join(root,relpath)
+	with open(abspath, "rb") as f:
+		md5sum = hashlib.md5(f.read()).hexdigest()
+	size = os.stat(abspath).st_size 
+	return FileMetadata(relpath, md5sum, size)
+
+
+def parsebackupstatusline(line):
+	m = re.match('^([a-z0-9]+) ([0-9]+) (.+)$', line)
+	if m is None:
+		raise Exception('Could not parse line %s' % repr(line))
+	return FileMetadata(m.group(3), m.group(1), int(m.group(2)))
+
+def loadbackupstatus(contents):
+	res = Backup()
+	for line in contents.split('\n'):
+		if line == '': continue
+		m = parsebackupstatusline(line)
+		res.addmetadata(m)
+	return res
+
+def snapshotdirectory(path):
+	"""Returns find all the files in a path and return a Backup object """
+	backup = Backup(abspath=path)
+	for root, dirs, files in os.walk(path):
+		for name in files:
+			if name == '.backupstatus': continue
+			m = filemetadataforpath(path, join(unjoin(path,root), name))
+			backup.addmetadata(m)
+	return backup
+
+def readbackupmetadata(directory):
+	try:
+		with open(join(directory,'.backupstatus'), 'r') as f:
+			contents = f.read()
+			if contents.strip() == 'ignore':
+				return BackupUnnecessary
+			return loadbackupstatus(contents)
+	except IOError:	
+		return NoBackup
+
+def getbackup(directory):
+	"""Returns a Backup object that is ready to backup a directory, or
+	None if the directory doesn't need backing up. A directory needs 
+	backing up if: 
+	 - There is no .backupstatus
+	 - or there is one (which doesn't contain 'ignore') and there a new 
+	   files"""
+	existing = readbackupmetadata(directory)
+	if existing is BackupUnnecessary:
+		return None
+	backup = snapshotdirectory(directory)
+	if existing is NoBackup:
+		return backup
+	elif backup == existing:
+		return None
+	else:
+		return backup
+
+class UnjoinTestCase(unittest.TestCase):
+	def testUnjoin(self):
+		self.assertEqual(unjoin('/tmp/bar', '/tmp'), 'bar')
+
+class FileMetadataTestCase(unittest.TestCase):
+	def testLoadSave(self):
+		o = FileMetadata('foo/bar baz.png', 'aaaabbdd', 1234)
+		self.assertEqual(parsebackupstatusline(o.save()), o)
+
+class BackupTestCase(unittest.TestCase):
+	def testBackupEqualsBackup(self):
+		self.assertEqual(snapshotdirectory('tests/t1'), snapshotdirectory('tests/t1'))
+	def testNoBackupStatusNeedsBackup(self):
+		self.assertIsNotNone(getbackup('tests/t1'))
+	def testIgnoreDoesntNeedBackup(self):
+		self.assertIsNone(getbackup('tests/t2'))
+	def testNewFilesNeedBackup(self):
+		self.assertIsNotNone(getbackup('tests/t3'))
+	def testUptoDateBackup(self):
+		self.assertIsNone(getbackup('tests/t4'))
+	def testNoBackupNeededAfterBackup(self):
+		try:
+			os.remove('tests/t5/.backupstatus')
+		except OSError:
+			pass
+		b = getbackup('tests/t5')
+		b.writebackupstatus()
+		b2 = getbackup('tests/t5')
+		self.assertIsNone(b2) # We just backed it up!
+
+if __name__ == '__main__':
+	parser = argparse.ArgumentParser(description='Backup photos to Glacier')
+	parser.add_argument('--test', action='store_true')
+	parser.add_argument('--photodir', action='store' )
+	args = parser.parse_args()
+	if args.test:
+		sys.argv = sys.argv[:1]
+		unittest.main()
+	else:
+		# TODO
+		gpgkeys = ['177D9C1B']	
+		newdirs = []
+		dirs = []
+		for d in os.listdir(args.photodir):
+			if os.path.exists(join(args.photodir, d)):
+				dirs.append(d)
+			else:
+				newdirs.append(d)
+		# Start uploading new directories first, before dealing with old ones
+		dirs = newdirs + dirs
+
+		for d in dirs:
+			backup = getbackup(join(args.photodir, d))
+			if not backup is None:
+				fn = "%s %s.tar.bz2.gpg" % (datetime.date.today(), d)
+				print "Backing up %s to %s" % (d, fn)
+				backup.writebackup('/tmp/' + fn, gpgkeys)
+				print "Uploading backup to glacier"
+				# TODO
+				print "Upload done. Writing .backupstatus"
+				backup.writebackupstatus()
