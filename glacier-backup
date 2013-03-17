@@ -33,8 +33,8 @@ import datetime
 import subprocess
 import tarfile
 from operator import attrgetter
-
-
+from ConfigParser import ConfigParser
+import boto.glacier
 
 def unjoin(abspath, root):
 	if not abspath.startswith(root):
@@ -75,7 +75,9 @@ class Backup(object):
 			for file in self.files.values():
 				if os.stat(join(self.abspath, file.relpath)).st_size != file.size:
 					raise Exception("Length of file %s has changed. Aborting" % file.relpath)
-				tarball.add(join(self.abspath, file.relpath), arcname=file.relpath, recursive=False)
+				arcname = join(os.path.split(self.abspath)[1], file.relpath)
+				print arcname
+				tarball.add(join(self.abspath, file.relpath), arcname=arcname, recursive=False)
 			tarball.close()
 			gpgproc.stdin.close()
 			gpgproc.wait()	
@@ -198,31 +200,45 @@ class BackupTestCase(unittest.TestCase):
 if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='Backup photos to Glacier')
 	parser.add_argument('--test', action='store_true')
-	parser.add_argument('--photodir', action='store' )
+	parser.add_argument('--justone', action='store_true')
 	args = parser.parse_args()
 	if args.test:
 		sys.argv = sys.argv[:1]
 		unittest.main()
 	else:
-		# TODO
-		gpgkeys = ['177D9C1B']	
+		cfg = ConfigParser()
+		cfg.read(os.path.expanduser('~/.glacier-backup'))
+		gpgkeys = cfg.get('backup','keys').split(' ')
+		photodir = cfg.get('backup', 'rootdir')
+		glacier = boto.glacier.connect_to_region(
+				cfg.get('backup','region'),
+				aws_access_key_id=cfg.get('backup', 'accesskey'),
+				aws_secret_access_key=cfg.get('backup', 'secretkey'))
+		vault = glacier.get_vault(cfg.get('backup','vault'))
 		newdirs = []
 		dirs = []
-		for d in os.listdir(args.photodir):
-			if os.path.exists(join(args.photodir, d)):
+		for d in os.listdir(photodir):
+			if os.path.exists(join(photodir, d, '.backupstatus')):
 				dirs.append(d)
 			else:
 				newdirs.append(d)
+		# My photos are in directories like "YYYY-MM-DD Thing". Upload more recent photos first
+		newdirs.sort(reverse=True) 
 		# Start uploading new directories first, before dealing with old ones
 		dirs = newdirs + dirs
-
+		print newdirs
 		for d in dirs:
-			backup = getbackup(join(args.photodir, d))
+			backup = getbackup(join(photodir, d))
 			if not backup is None:
 				fn = "%s %s.tar.bz2.gpg" % (datetime.date.today(), d)
 				print "Backing up %s to %s" % (d, fn)
-				backup.writebackup('/tmp/' + fn, gpgkeys)
+				tmpfilename = '/tmp/' + fn
+				backup.writebackup(tmpfilename, gpgkeys)
 				print "Uploading backup to glacier"
-				# TODO
+				vault.upload_archive(tmpfilename)
 				print "Upload done. Writing .backupstatus"
 				backup.writebackupstatus()
+				if args.justone:
+					print "stopping after one"	
+					break	
+		
