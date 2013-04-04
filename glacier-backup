@@ -18,7 +18,7 @@ tar, bz2 and gpg the contents into a temporary file
 Upload this to glacier with boto.
 Write the .backupstatus file
 
-As an optimisation, we backup directories that definately need doing
+As an optimisation, we backup directories that definitely need doing
 (there is no .backupstatus file) first, and then 
 """
 
@@ -135,7 +135,7 @@ def snapshotdirectory(path):
 	for root, dirs, files in os.walk(path):
 		for name in files:
 			if name == '.backupstatus': continue
-			m = filemetadataforpath(path, join(unjoin(path,root), name))
+			m = filemetadataforpath(path, join(unjoin(root,path), name))
 			backup.addmetadata(m)
 	return backup
 
@@ -218,6 +218,9 @@ if __name__ == '__main__':
 		newdirs = []
 		dirs = []
 		for d in os.listdir(photodir):
+			if not os.path.isdir(join(photodir,d)):
+				print "Skipping non-directory %s" % d
+				continue
 			if os.path.exists(join(photodir, d, '.backupstatus')):
 				dirs.append(d)
 			else:
@@ -226,7 +229,6 @@ if __name__ == '__main__':
 		newdirs.sort(reverse=True) 
 		# Start uploading new directories first, before dealing with old ones
 		dirs = newdirs + dirs
-		print newdirs
 		for d in dirs:
 			backup = getbackup(join(photodir, d))
 			if not backup is None:
