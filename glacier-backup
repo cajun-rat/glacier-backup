@@ -27,7 +27,7 @@ import sys
 import re
 import hashlib
 import argparse
-from os.path import join
+from os.path import join, basename, split
 import os
 import datetime
 import subprocess
@@ -35,6 +35,8 @@ import tarfile
 from operator import attrgetter
 from ConfigParser import ConfigParser
 import boto.glacier
+from time import sleep
+from sys import exit
 
 def unjoin(abspath, root):
 	if not abspath.startswith(root):
@@ -197,24 +199,17 @@ class BackupTestCase(unittest.TestCase):
 		b2 = getbackup('tests/t5')
 		self.assertIsNone(b2) # We just backed it up!
 
-if __name__ == '__main__':
-	parser = argparse.ArgumentParser(description='Backup photos to Glacier')
-	parser.add_argument('--test', action='store_true')
-	parser.add_argument('--justone', action='store_true')
-	args = parser.parse_args()
-	if args.test:
-		sys.argv = sys.argv[:1]
-		unittest.main()
-	else:
-		cfg = ConfigParser()
-		cfg.read(os.path.expanduser('~/.glacier-backup'))
-		gpgkeys = cfg.get('backup','keys').split(' ')
-		photodir = cfg.get('backup', 'rootdir')
-		glacier = boto.glacier.connect_to_region(
-				cfg.get('backup','region'),
-				aws_access_key_id=cfg.get('backup', 'accesskey'),
-				aws_secret_access_key=cfg.get('backup', 'secretkey'))
-		vault = glacier.get_vault(cfg.get('backup','vault'))
+def performonebackup(vault, backup, leafdir):
+	fn = "%s %s.tar.bz2.gpg" % (datetime.date.today(), leafdir)
+	print "Backing up %s to %s" % (leafdir, fn)
+	tmpfilename = '/tmp/' + fn
+	backup.writebackup(tmpfilename, gpgkeys)
+	print "Uploading backup to glacier"
+	vault.upload_archive(tmpfilename, description=leafdir)
+	print "Upload done. Writing .backupstatus"
+	backup.writebackupstatus()
+
+def performbackup(vault, photodir, justone=False):
 		newdirs = []
 		dirs = []
 		for d in os.listdir(photodir):
@@ -232,15 +227,67 @@ if __name__ == '__main__':
 		for d in dirs:
 			backup = getbackup(join(photodir, d))
 			if not backup is None:
-				fn = "%s %s.tar.bz2.gpg" % (datetime.date.today(), d)
-				print "Backing up %s to %s" % (d, fn)
-				tmpfilename = '/tmp/' + fn
-				backup.writebackup(tmpfilename, gpgkeys)
-				print "Uploading backup to glacier"
-				vault.upload_archive(tmpfilename)
-				print "Upload done. Writing .backupstatus"
-				backup.writebackupstatus()
-				if args.justone:
+				performonebackup(vault, backup, d)
+				if justone:
 					print "stopping after one"	
 					break	
-		
+	
+def spinandfetch(vault, jobid):
+	remaining = 100
+	while remaining > 0:
+		remaining -=1
+		job = vault.get_job(jobid)
+		if job.completed:
+			print "Job done. Fetching"
+			return job.get_output()
+		else:
+			print "not ready, sleeping"
+			sleep(20*60)
+
+def dumpinventory(inventoryjoboutput):
+	for archive in inventoryjoboutput['ArchiveList']:
+		fn = archive['ArchiveDescription']
+		if fn == '':
+			fn = '(unknown)'
+		print "%s %.0f MB %s" % (fn, archive['Size']/1e6, archive['CreationDate'][:10])
+
+
+if __name__ == '__main__':
+	parser = argparse.ArgumentParser(description='Backup photos to Glacier')
+	parser.add_argument('--test', action='store_true')
+	parser.add_argument('--justone', action='store_true')
+	parser.add_argument('--only')
+	parser.add_argument('--inventory', action='store_true')
+	args = parser.parse_args()
+	if args.test:
+		sys.argv = sys.argv[:1]
+		unittest.main()
+	else:
+		cfg = ConfigParser()
+		cfg.read(os.path.expanduser('~/.glacier-backup'))
+		gpgkeys = cfg.get('backup','keys').split(' ')
+		glacier = boto.glacier.connect_to_region(
+				cfg.get('backup','region'),
+				aws_access_key_id=cfg.get('backup', 'accesskey'),
+				aws_secret_access_key=cfg.get('backup', 'secretkey'))
+		vault = glacier.get_vault(cfg.get('backup','vault'))
+		if args.inventory:
+			job = vault.retrieve_inventory()
+			inventory = spinandfetch(vault, job)
+			dumpinventory(inventory)
+		elif args.only:
+			d = args.only
+			if not os.path.isdir(d):
+				print "Cannot backup non-directory %s" % d
+				exit(1)
+			backup = getbackup(d)
+			if not backup is None:
+				print "Backing up single directory %s" % d
+				leafname = basename(d)
+				if leafname == '':
+					leafname = basename(split(d)[0])
+				performonebackup(vault, backup, leafname)
+			else:
+				print "Directory %s doesn't need backing up" % d	
+		else:
+			performbackup(vault, cfg.get('backup', 'rootdir'), args.justone)
