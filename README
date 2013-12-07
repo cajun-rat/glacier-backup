@@ -1,5 +1,42 @@
-TODO
+glacier-backup
+==============
 
+Encrypted backup of photos to AWS glacier. I keep my photos in a series of
+directories that are named with the date and event. If you do something 
+similar, then this tool can help back them up to AWS Glacier. To make it go:
+
+* Install the boto library
+* Create a vault on Glacier to store the backups (and create a IAM user
+  with permissions to access it)
+* Get gpg set up and add your friends gpg keys (you don't want to lose your
+  photos in a HDD crash that takes out your gpg key).
+* Create a ~/.glacier-backup configuration file. It is in the python 
+  ini-style file format, and should look like this:
+  
+[backup]
+rootdir=/home/me/MyPhotos
+accesskey=<aws access key>
+secretkey=<aws secret access key>
+region=eu-west-1
+vault=photos
+keys=mygpgkey@example.com myfriend@example.com myotherfriend@example.com
+
+* Run glacier-backup
+
+The operation is simple: glacier-backup looks at all the directories under
+/home/me/MyPhotos and decided whether they need backing up by looking at the 
+.backupstatus file in that directory:
+
+* If the file doesn't exist, the the directory gets backed up
+* If it contains the text 'ignore' the directory is ignored (I use this to
+  handle my 'incomming photos' directory).
+* Otherwise it compares the files in the directory with the backup status file,
+  and backs the directory up if there is anything new.
+
+
+
+TODO
+----
 Delete old tmp files
-Dont print list of directories on when running
+Dont print list of directories when running
 Print size of archive when uploading
