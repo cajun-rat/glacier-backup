@@ -35,6 +35,7 @@ import tarfile
 from operator import attrgetter
 from ConfigParser import ConfigParser
 import boto.glacier
+from boto.glacier.concurrent import ConcurrentUploader
 from time import sleep
 from sys import exit
 
@@ -205,7 +206,7 @@ def performonebackup(vault, backup, leafdir):
 	tmpfilename = '/tmp/' + fn
 	backup.writebackup(tmpfilename, gpgkeys)
 	print "Uploading backup to glacier"
-	vault.upload_archive(tmpfilename, description=leafdir)
+	vault.concurrent_create_archive_from_file(tmpfilename, description=leafdir, num_threads=1)
 	print "Upload done. Writing .backupstatus"
 	backup.writebackupstatus()
 
